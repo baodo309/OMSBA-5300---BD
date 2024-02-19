@@ -1,0 +1,232 @@
+---
+title: "Data Exploration"
+author: "Bao Do"
+date: "2024-02-12"
+output:
+  word_document: default
+  html_document: default
+---
+
+## Introduction: 
+The analysis aims to investigate whether the release of the College Scorecard in September 2015 influenced student interest, as proxied by Google search activity, in colleges with high-earning graduates relative to those with low-earning graduates among institutions that predominantly grant bachelor's degrees. To address this research question, a differences-in-differences regression analysis with fixed effects was performed.
+
+```{r setup, include=FALSE}
+#Load libraries
+library(rio)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(fixest)
+library(vtable)
+library(lmtest)
+```
+
+## Data Cleaning
+
+### Read Google Trends Data
+The initial step in this data cleaning process involves importing Google Trends data from multiple files and combining them into a unified dataset. Using the list of file names obtained from the specified directory, the data is read and concatenated.
+
+```{r}
+#Load dataset 
+directory_path <- "C:/Users/dob22/OneDrive/Desktop/Spring 2024/Econometrics/Data_Exploration_Rawdata/Lab3_Rawdata"
+
+#Read Google Trends Data
+file_names <- list.files(directory_path, pattern = "trends_up_to_.+\\.csv", full.names = TRUE)
+
+#Read the files and bind them together
+trends_data <- import_list(file_names, rbind = TRUE)
+```
+
+### Aggregating the Google Trends data
+The next step involves aggregating the Google Trends data to a monthly level. This includes extracting the first ten characters from the 'monthorweek' variable, converting it into a date format, and then further aggregating the data by month. 
+
+```{r}
+#Get the first ten characters out of the monthorweek variable and aggregate the dates to months
+trends_data$monthorweek <- str_sub(trends_data$monthorweek, 1, 10)
+
+trends_data$date <- ymd(trends_data$monthorweek)
+trends_data$month <- floor_date(trends_data$date, unit = "month")
+```
+
+Subsequently, the index variable is standardized by school name and keyword, and the standardized index variable is aggregated to the keyword-month level.
+
+```{r}
+#Standardize index variable by school name and keyword
+trends_data <- trends_data %>%
+  group_by(schname, keyword) %>%
+  mutate(standardized_index = (index - mean(index, na.rm = TRUE)) / sd(index, na.rm = TRUE))
+
+#Aggregate standardized index variable to the keyword-month level
+aggregated_data <- trends_data %>%
+  group_by(keyword, month) %>%
+  summarize(mean_standardized_index = mean(standardized_index, na.rm = TRUE))
+
+#print(aggregated_data)
+```
+
+### Reading in the Scorecard data
+
+Shifting to the Scorecard data, relevant files are read, and operations are performed to join and filter the data.
+
+```{r}
+scorecard_file <- "C:/Users/dob22/OneDrive/Desktop/Spring 2024/Econometrics/Data_Exploration_Rawdata/Lab3_Rawdata/Most+Recent+Cohorts+(Scorecard+Elements).csv"
+dictionary_file <- "C:/Users/dob22/OneDrive/Desktop/Spring 2024/Econometrics/Data_Exploration_Rawdata/Lab3_Rawdata/CollegeScorecardDataDictionary-09-08-2015.csv"
+id_name_link_file <- "C:/Users/dob22/OneDrive/Desktop/Spring 2024/Econometrics/Data_Exploration_Rawdata/Lab3_Rawdata/id_name_link.csv"
+
+#Read in the Scorecard data
+scorecard <- import(scorecard_file)
+
+#Read in the id_name_link file
+id_name_link <- import(id_name_link_file)
+```
+
+### Merging the Scorecard data
+
+```{r}
+#count how many times each school name shows up in id_name_link
+inl_count <- id_name_link %>%
+  group_by(schname) %>%
+  mutate(n = n()) %>%
+  filter(n == 1) %>%
+  select(-n)
+
+#Joining data
+joined_data <- inner_join(trends_data, inl_count, by = "schname")
+
+#Rename columns in joined_data to match the case in scorecard
+colnames(joined_data) <- toupper(colnames(joined_data))
+
+#Join joined_data and scorecard and delete duplicates
+final_dataset <- inner_join(joined_data, scorecard, by = "OPEID")
+
+final_dataset <- final_dataset %>%
+  group_by(SCHNAME) %>%
+  filter(n_distinct(SCHID) == 1) %>%
+  ungroup()
+
+```
+
+## Analysis
+
+Before conducting analysis, the final dataset was filtered to only include institutions that predominantly grant bachelor's degrees. Subsequently, the reported earnings column was examined to identify the highest and lowest values. 
+
+```{r}
+#Filter final dataset to bachelor's degree granting schools
+bachelors_only <- filter(final_dataset, PREDDEG == 3)
+
+#Convert md_earn_wne_p10-REPORTED-EARNINGS to numeric and remove NULL values
+bachelors_only$`md_earn_wne_p10-REPORTED-EARNINGS` <- as.numeric(bachelors_only$`md_earn_wne_p10-REPORTED-EARNINGS`)
+bachelors_only <- bachelors_only[!is.na(bachelors_only$`md_earn_wne_p10-REPORTED-EARNINGS`), ]
+
+# Find the highest value and lowest value
+highest_value <- max(bachelors_only$`md_earn_wne_p10-REPORTED-EARNINGS`, na.rm = TRUE)
+print(highest_value)
+lowest_value <- min(bachelors_only$`md_earn_wne_p10-REPORTED-EARNINGS`, na.rm = TRUE)
+print(lowest_value)
+```
+
+High-earning and low-earning colleges were then defined by dividing the range of median earnings into three equal parts, with the top one-third representing high-earning colleges and the bottom one-third representing low-earning colleges. This section was done manually.
+
+Range = Highest Value (74700) - Lowest Value (17600) = 57100 \n
+Width of each range = Range (57100) / Width of each range (3) = 19033 \n
+Low Earnings: 17600 to 36633 \n
+Medium Earnings: 36633 to 55666 \n
+High Earnings: 55666 to 74700 \n
+
+```{r}
+#Define high vs low earning colleges
+bachelors_only$HIGH_EARNINGS <- ifelse(bachelors_only$`md_earn_wne_p10-REPORTED-EARNINGS` > 55000, 1, 0)
+
+#sumtable(bachelors_only)
+
+#Print to check the results
+print(unique(bachelors_only$HIGH_EARNINGS))
+```
+
+The region variable was then created by mapping states to their overarching Census region. This grouping accounts for shared unobserved factors influencing colleges within geographic proximity and facilitates making broader conclusions.
+
+```{r}
+#Aggregate up to the region-month level
+bachelors_only <- bachelors_only %>%
+  mutate(region = case_when(
+    STABBR %in% c("CT", "ME", "MA", "NH", "RI", "VT") ~ "New England",
+    STABBR %in% c("DE", "DC", "MD", "NJ", "NY", "PA") ~ "Mid East",
+    STABBR %in% c("IL", "IN", "MI", "OH", "WI") ~ "Great Lakes",
+    STABBR %in% c("IA", "KS", "MN", "MO", "NE", "ND", "SD") ~ "Plains",
+    STABBR %in% c("AL", "AR", "FL", "GA", "KY", "LA", "MS", "NC", "SC", "TN", "VA", "WV") ~ "Southeast",
+    STABBR %in% c("AZ", "NM", "OK", "TX") ~ "Southwest",
+    STABBR %in% c("CO", "ID", "MT", "UT", "WY") ~ "Rocky Mountains",
+    STABBR %in% c("AK", "CA", "HI", "NV", "OR", "WA") ~ "Far West",
+    TRUE ~ "Other"
+  ))
+
+regional_trends <- bachelors_only %>% 
+  group_by(region, MONTH,`md_earn_wne_p10-REPORTED-EARNINGS`,HIGH_EARNINGS) %>%
+  summarise(MEAN_STANDARDIZED_INDEX = mean(STANDARDIZED_INDEX))
+```
+The PRE_POST_POLICY variable was created to have an indicator separating the periods before and after September 2015 when the College Scorecard website launched. This variable takes the value "Pre" for months before September 2015 and "Post" for months after the launch date. This binary coding allows for a numerical comparison of the periods before and after the policy implementation, rather than relying solely on categorical labels.
+
+Next, the code employs a differences-in-differences regression approach to assess the differential impact of the College Scorecard introduction on search activity between high-earning colleges (treatment group) and low-earning colleges (control group).
+
+The first model, basic, is a simple regression of MEAN_STANDARDIZED_INDEX on md_earn_wne_p10-REPORTED-EARNINGS. This baseline model serves as a reference point.The main model of interest, fe_model, incorporates the difference-in-differences specification. It includes the interaction term between md_earn_wne_p10-REPORTED-EARNINGS and PRE_POST_POLICY, as well as fixed effects for region and the HIGH_EARNINGS indicator variable. The interaction term captures the differential impact of the College Scorecard introduction on search activity for colleges with varying levels of post-graduation earnings.
+
+The coefficient on the interaction term md_earn_wne_p10-REPORTED-EARNINGS * PRE_POST_POLICY represents the difference-in-difference estimate, quantifying the change in search index trends for colleges with higher earnings relative to those with lower earnings, after the policy implementation compared to before. This is the key estimate of interest, as it isolates the effect of the College Scorecard release on search activity for high-earnings colleges relative to low-earnings colleges. 
+
+Finally, by including region fixed effects (factor(region)), the model controls for time-invariant regional factors that may influence search activity. The HIGH_EARNINGS variable, which may be an indicator for colleges above a certain earnings threshold, is also included as a control variable.
+
+```{r}
+#Create an indicator variable for the pre/post policy period
+regional_trends <- regional_trends %>%
+  mutate(PRE_POST_POLICY = ifelse(MONTH < as.Date("2015-09-01"), "Pre", "Post"))
+
+#Run differences-in-differences regression with fixed effects
+basic <- feols(MEAN_STANDARDIZED_INDEX ~ `md_earn_wne_p10-REPORTED-EARNINGS`, data = regional_trends)
+fe_model <- feols(MEAN_STANDARDIZED_INDEX ~ `md_earn_wne_p10-REPORTED-EARNINGS` * PRE_POST_POLICY + 
+                    factor(region) + HIGH_EARNINGS , data = regional_trends)
+
+#Print summary an etable results
+summary(fe_model)
+etable(basic,fe_model)
+```
+
+In the basic model, neither the median 10 year earnings variable (md_earn_wne_p10-REPORTED-EARNINGS) nor the constant are statistically significant. This basic specification also exhibits no explanatory power, with an R-squared of essentially 0.
+
+The second model includes an indicator for the pre/post September 2015 period when the College Scorecard website launched, in addition to census region factors. Here, the policy variable (PRE_POST_POLICYPre) is positively associated with the outcome at the p<0.05 level, suggesting some increase in search activity after September 2015 on average. The expanded model also fits better, now explaining over 4% of variation. In addition, this second model incorporates the key difference-in-differences interaction between college earnings levels and pre/post indicators. However, the interaction term is not statistically significant. Furthermore, the regional factors yield small coefficients, implying limited explanatory region-specific variation relative to reference areas.
+
+Overall, even with the added earnings indicator, the model indicates no significant evidence that the introduction of the College Scorecard website substantively reallocated attention towards high earning institutions among bachelor’s colleges. Neither the small double interaction term nor the individual earning predictor show significant relationships in shifting search trends.
+
+```{r}
+
+#Plot the linear model
+ggplot(regional_trends, aes(x = `md_earn_wne_p10-REPORTED-EARNINGS`, y = MEAN_STANDARDIZED_INDEX)) +
+  geom_point(color = "blue", alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(title = "Linear Regression Model FE",
+       x = "Predicted Values",
+       y = "Actual Values")
+
+
+#Plot the polynomial regression model
+ggplot(regional_trends, aes(x = `md_earn_wne_p10-REPORTED-EARNINGS`, y = MEAN_STANDARDIZED_INDEX)) +
+  geom_point(color = "blue", alpha = 0.7) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, degree = 3), se = FALSE, color = "red") +
+  labs(title = "Polynomial Regression Model FE",
+       x = "Predicted Values",
+       y = "Actual Values")
+
+```
+
+Based on the scatterplots above, both the linear and polynomial regression visualizations appear nearly identical.
+Both graphs plot median 10 year college graduate earnings on the x-axis against average monthly search popularity on the y-axis, with each blue point representing an observation at the region-month level. The linear fit line minimizes squared errors assuming a straight-line association between earnings and searches. Meanwhile, the polynomial expands this to test for potential nonlinearities, fitting a more flexible cubic curve.
+
+Additionally, both graphs exhibit a slight positive slope, indicating that the search index tends to increase with higher median graduate pay. However, this relationship is accompanied by considerable variability in the data points.Furthermore, the high degree of overlap implies adding nonlinear flexibility does not provide significantly improved model fit from a purely linear specification. The earnings-attention connection holds mostly steady rather than dramatically accelerating or declining at certain salary thresholds. As a result, neither model version indicates clear shifting attention toward high-paying schools after policy rollout either—the displayed graduating earnings connection itself remains marginal.
+
+## Conclusion
+
+The difference-in-differences model estimate suggests that after vs before the Scorecard rollout, the standardized search index increased by 0.00000312 units more for high earning colleges compared to low earning ones. However, this differential gain is negligible in practical terms and not statistically significant based on the standard error.
+
+Similarly, the graphical analyses do not demonstrate strong evidence of diverging trends between high and low earning institutions across regions when examining search popularity before and after September 2015. While some areas saw slightly greater gains for higher earning schools post-policy, this pattern does not clearly or consistently emerge across locations. The association between graduate earnings and search interests remains positive but small in magnitude over time.
+
+Therefore, based on the available data and methodology, there is insufficient support to conclude that the introduction of the College Scorecard website substantially shifted attention towards bachelor's-level colleges with high-earning graduates relative to those with low-earning graduates.
